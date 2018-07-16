@@ -27,6 +27,7 @@ StringRef Triple::getArchTypeName(ArchType Kind) {
   case armeb:          return "armeb";
   case arc:            return "arc";
   case avr:            return "avr";
+  case evm:             return "evm";
   case bpfel:          return "bpfel";
   case bpfeb:          return "bpfeb";
   case hexagon:        return "hexagon";
@@ -264,6 +265,7 @@ Triple::ArchType Triple::getArchTypeForLLVMName(StringRef Name) {
     .Case("arm", arm)
     .Case("armeb", armeb)
     .Case("avr", avr)
+    .Case("EVM", evm)
     .StartsWith("bpf", BPFArch)
     .Case("mips", mips)
     .Case("mipsel", mipsel)

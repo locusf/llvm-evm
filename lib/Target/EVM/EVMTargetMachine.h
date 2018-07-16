@@ -30,9 +30,15 @@ public:
 
   TargetPassConfig *createPassConfig(PassManagerBase &PM) override;
 
+
   TargetLoweringObjectFile *getObjFileLowering() const override {
     return TLOF.get();
   }
+
+  // TargetMachine interface
+public:
+  virtual bool addPassesToEmitFile(llvm::legacy::PassManagerBase &, raw_pwrite_stream &, raw_pwrite_stream *, CodeGenFileType, bool, MachineModuleInfo *MMI) override;
+  virtual bool addPassesToEmitMC(llvm::legacy::PassManagerBase &, MCContext *&, raw_pwrite_stream &, bool) override;
 };
 }
 

@@ -52,6 +52,7 @@ public:
     aarch64_be,     // AArch64 (big endian): aarch64_be
     arc,            // ARC: Synopsys ARC
     avr,            // AVR: Atmel AVR microcontroller
+    evm,
     bpfel,          // eBPF or extended BPF or 64-bit BPF (little endian)
     bpfeb,          // eBPF or extended BPF or 64-bit BPF (big endian)
     hexagon,        // Hexagon: hexagon
@@ -96,7 +97,7 @@ public:
     wasm64,         // WebAssembly with 64-bit pointers
     renderscript32, // 32-bit RenderScript
     renderscript64, // 64-bit RenderScript
-    LastArchType = renderscript64
+    LastArchType = renderscript64,
   };
   enum SubArchType {
     NoSubArch,
