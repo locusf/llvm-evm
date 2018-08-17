@@ -93,7 +93,7 @@ def : ReadAdvance<ReadAfterLd, 4>;
 // The Integer PRF for Zen is 168 entries, and it holds the architectural and
 // speculative version of the 64-bit integer registers.
 // Reference: "Software Optimization Guide for AMD Family 17h Processors"
-def ZnIntegerPRF : RegisterFile<168, [GR8, GR16, GR32, GR64, CCR]>;
+def ZnIntegerPRF : RegisterFile<168, [GR64, CCR]>;
 
 // 36 Entry (9x4 entries) floating-point Scheduler
 def ZnFPU     : ProcResGroup<[ZnFPU0, ZnFPU1, ZnFPU2, ZnFPU3]> {
@@ -179,7 +179,18 @@ defm : ZnWriteResPair<WriteALU,   [ZnALU], 1>;
 defm : ZnWriteResPair<WriteADC,   [ZnALU], 1>;
 defm : ZnWriteResPair<WriteIMul,   [ZnALU1, ZnMultiplier], 4>;
 defm : ZnWriteResPair<WriteIMul64, [ZnALU1, ZnMultiplier], 4, [1,1], 2>;
+
+defm : X86WriteRes<WriteBSWAP32, [ZnALU], 1, [4], 1>;
+defm : X86WriteRes<WriteBSWAP64, [ZnALU], 1, [4], 1>;
+defm : X86WriteRes<WriteXCHG, [ZnALU], 1, [2], 2>;
+
 defm : ZnWriteResPair<WriteShift, [ZnALU], 1>;
+
+defm : X86WriteRes<WriteSHDrri, [ZnALU], 1, [1], 1>;
+defm : X86WriteResUnsupported<WriteSHDrrcl>;
+defm : X86WriteResUnsupported<WriteSHDmri>;
+defm : X86WriteResUnsupported<WriteSHDmrcl>;
+
 defm : ZnWriteResPair<WriteJump,  [ZnALU], 1>;
 defm : ZnWriteResFpuPair<WriteCRC32, [ZnFPU0], 3>;
 
@@ -188,12 +199,14 @@ defm : ZnWriteResPair<WriteCMOV2,  [ZnALU], 1>;
 def  : WriteRes<WriteSETCC,  [ZnALU]>;
 def  : WriteRes<WriteSETCCStore,  [ZnALU, ZnAGU]>;
 defm : X86WriteRes<WriteLAHFSAHF, [ZnALU], 2, [1], 2>;
+def  : WriteRes<WriteBitTest,[ZnALU]>;
 
 // Bit counts.
-defm : ZnWriteResPair<WriteBitScan, [ZnALU], 3>;
-defm : ZnWriteResPair<WriteLZCNT,   [ZnALU], 2>;
-defm : ZnWriteResPair<WriteTZCNT,   [ZnALU], 2>;
-defm : ZnWriteResPair<WritePOPCNT,  [ZnALU], 1>;
+defm : ZnWriteResPair<WriteBSF, [ZnALU], 3>;
+defm : ZnWriteResPair<WriteBSR, [ZnALU], 3>;
+defm : ZnWriteResPair<WriteLZCNT,          [ZnALU], 2>;
+defm : ZnWriteResPair<WriteTZCNT,          [ZnALU], 2>;
+defm : ZnWriteResPair<WritePOPCNT,         [ZnALU], 1>;
 
 // Treat misc copies as a move.
 def : InstRW<[WriteMove], (instrs COPY)>;
@@ -487,14 +500,6 @@ def : InstRW<[WriteALULd, ReadAfterLd], (instregex "MOV16rm")>;
 def : InstRW<[WriteLoad], (instregex "MOV(S|Z)X32rm(8|16)")>;
 
 // XCHG.
-// r,r.
-def ZnWriteXCHG : SchedWriteRes<[ZnALU]> {
-  let NumMicroOps = 2;
-  let ResourceCycles = [2];
-}
-
-def : InstRW<[ZnWriteXCHG], (instregex "XCHG(8|16|32|64)rr", "XCHG(16|32|64)ar")>;
-
 // r,m.
 def ZnWriteXCHGrm : SchedWriteRes<[ZnAGU, ZnALU]> {
   let Latency = 5;
@@ -534,12 +539,6 @@ def : InstRW<[ZnWritePushA], (instregex "PUSHA(16|32)")>;
 
 //LAHF
 def : InstRW<[WriteMicrocoded], (instrs LAHF)>;
-
-// BSWAP.
-def ZnWriteBSwap : SchedWriteRes<[ZnALU]> {
-  let ResourceCycles = [4];
-}
-def : InstRW<[ZnWriteBSwap], (instregex "BSWAP")>;
 
 // MOVBE.
 // r,m.
@@ -801,6 +800,8 @@ def : InstRW<[WriteMicrocoded], (instregex "SCAS(B|W|L|Q)")>;
 def : InstRW<[WriteMicrocoded], (instregex "STOS(B|L|Q|W)")>;
 
 // XADD.
+def ZnXADD : SchedWriteRes<[ZnALU]>;
+def : InstRW<[ZnXADD], (instregex "XADD(8|16|32|64)rr")>;
 def : InstRW<[WriteMicrocoded], (instregex "XADD(8|16|32|64)rm")>;
 
 //=== Floating Point x87 Instructions ===//

@@ -26,6 +26,14 @@ namespace mca {
 
 using namespace llvm;
 
+bool ExecuteStage::isAvailable(const InstRef &IR) const {
+  HWStallEvent::GenericEventType Event;
+  if (HWS.canBeDispatched(IR, Event))
+    return true;
+  notifyEvent<HWStallEvent>(HWStallEvent(Event, IR));
+  return false;
+}
+
 // Reclaim the simulated resources used by the scheduler.
 void ExecuteStage::reclaimSchedulerResources() {
   SmallVector<ResourceRef, 8> ResourcesFreed;
@@ -35,20 +43,25 @@ void ExecuteStage::reclaimSchedulerResources() {
 }
 
 // Update the scheduler's instruction queues.
-void ExecuteStage::updateSchedulerQueues() {
+Error ExecuteStage::updateSchedulerQueues() {
   SmallVector<InstRef, 4> InstructionIDs;
-  HWS.updateIssuedQueue(InstructionIDs);
-  for (const InstRef &IR : InstructionIDs)
+  HWS.updateIssuedSet(InstructionIDs);
+  for (InstRef &IR : InstructionIDs) {
     notifyInstructionExecuted(IR);
+    //FIXME: add a buffer of executed instructions.
+    if (Error S = moveToTheNextStage(IR))
+      return S;
+  }
   InstructionIDs.clear();
 
   HWS.updatePendingQueue(InstructionIDs);
   for (const InstRef &IR : InstructionIDs)
     notifyInstructionReady(IR);
+  return ErrorSuccess();
 }
 
 // Issue instructions that are waiting in the scheduler's ready queue.
-void ExecuteStage::issueReadyInstructions() {
+Error ExecuteStage::issueReadyInstructions() {
   SmallVector<InstRef, 4> InstructionIDs;
   InstRef IR = HWS.select();
   while (IR.isValid()) {
@@ -59,15 +72,19 @@ void ExecuteStage::issueReadyInstructions() {
     const InstrDesc &Desc = IR.getInstruction()->getDesc();
     notifyReleasedBuffers(Desc.Buffers);
     notifyInstructionIssued(IR, Used);
-    if (IR.getInstruction()->isExecuted())
+    if (IR.getInstruction()->isExecuted()) {
       notifyInstructionExecuted(IR);
+      //FIXME: add a buffer of executed instructions.
+      if (Error S = moveToTheNextStage(IR))
+        return S;
+    }
 
     // Instructions that have been issued during this cycle might have unblocked
     // other dependent instructions. Dependent instructions may be issued during
     // this same cycle if operands have ReadAdvance entries.  Promote those
-    // instructions to the ReadyQueue and tell to the caller that we need
+    // instructions to the ReadySet and tell to the caller that we need
     // another round of 'issue()'.
-    HWS.promoteToReadyQueue(InstructionIDs);
+    HWS.promoteToReadySet(InstructionIDs);
     for (const InstRef &I : InstructionIDs)
       notifyInstructionReady(I);
     InstructionIDs.clear();
@@ -75,6 +92,8 @@ void ExecuteStage::issueReadyInstructions() {
     // Select the next instruction to issue.
     IR = HWS.select();
   }
+
+  return ErrorSuccess();
 }
 
 // The following routine is the maintenance routine of the ExecuteStage.
@@ -89,14 +108,17 @@ void ExecuteStage::issueReadyInstructions() {
 // Notifications are issued to this stage's listeners when instructions are
 // moved between the HWS's queues.  In particular, when an instruction becomes
 // ready or executed.
-void ExecuteStage::preExecute(const InstRef &Unused) {
+Error ExecuteStage::cycleStart() {
   reclaimSchedulerResources();
-  updateSchedulerQueues();
-  issueReadyInstructions();
+  if (Error S = updateSchedulerQueues())
+    return S;
+  return issueReadyInstructions();
 }
 
 // Schedule the instruction for execution on the hardware.
-bool ExecuteStage::execute(InstRef &IR) {
+Error ExecuteStage::execute(InstRef &IR) {
+  assert(isAvailable(IR) && "Scheduler is not available!");
+
 #ifndef NDEBUG
   // Ensure that the HWS has not stored this instruction in its queues.
   HWS.sanityCheck(IR);
@@ -112,7 +134,7 @@ bool ExecuteStage::execute(InstRef &IR) {
   // Obtain a slot in the LSU.  If we cannot reserve resources, return true, so
   // that succeeding stages can make progress.
   if (!HWS.reserveResources(IR))
-    return true;
+    return ErrorSuccess();
 
   // If we did not return early, then the scheduler is ready for execution.
   notifyInstructionReady(IR);
@@ -133,9 +155,9 @@ bool ExecuteStage::execute(InstRef &IR) {
   // If we cannot issue immediately, the HWS will add IR to its ready queue for
   // execution later, so we must return early here.
   if (!HWS.issueImmediately(IR))
-    return true;
+    return ErrorSuccess();
 
-  LLVM_DEBUG(dbgs() << "[SCHEDULER] Instruction " << IR
+  LLVM_DEBUG(dbgs() << "[SCHEDULER] Instruction #" << IR
                     << " issued immediately\n");
 
   // Issue IR.  The resources for this issuance will be placed in 'Used.'
@@ -145,22 +167,25 @@ bool ExecuteStage::execute(InstRef &IR) {
   // Perform notifications.
   notifyReleasedBuffers(Desc.Buffers);
   notifyInstructionIssued(IR, Used);
-  if (IR.getInstruction()->isExecuted())
+  if (IR.getInstruction()->isExecuted()) {
     notifyInstructionExecuted(IR);
-
-  return true;
+    //FIXME: add a buffer of executed instructions.
+    return moveToTheNextStage(IR);
+  }
+  return ErrorSuccess();
 }
 
 void ExecuteStage::notifyInstructionExecuted(const InstRef &IR) {
   HWS.onInstructionExecuted(IR);
-  LLVM_DEBUG(dbgs() << "[E] Instruction Executed: " << IR << '\n');
-  notifyInstructionEvent(HWInstructionEvent(HWInstructionEvent::Executed, IR));
-  RCU.onInstructionExecuted(IR.getInstruction()->getRCUTokenID());
+  LLVM_DEBUG(dbgs() << "[E] Instruction Executed: #" << IR << '\n');
+  notifyEvent<HWInstructionEvent>(
+      HWInstructionEvent(HWInstructionEvent::Executed, IR));
 }
 
 void ExecuteStage::notifyInstructionReady(const InstRef &IR) {
-  LLVM_DEBUG(dbgs() << "[E] Instruction Ready: " << IR << '\n');
-  notifyInstructionEvent(HWInstructionEvent(HWInstructionEvent::Ready, IR));
+  LLVM_DEBUG(dbgs() << "[E] Instruction Ready: #" << IR << '\n');
+  notifyEvent<HWInstructionEvent>(
+      HWInstructionEvent(HWInstructionEvent::Ready, IR));
 }
 
 void ExecuteStage::notifyResourceAvailable(const ResourceRef &RR) {
@@ -173,14 +198,14 @@ void ExecuteStage::notifyResourceAvailable(const ResourceRef &RR) {
 void ExecuteStage::notifyInstructionIssued(
     const InstRef &IR, ArrayRef<std::pair<ResourceRef, double>> Used) {
   LLVM_DEBUG({
-    dbgs() << "[E] Instruction Issued: " << IR << '\n';
+    dbgs() << "[E] Instruction Issued: #" << IR << '\n';
     for (const std::pair<ResourceRef, unsigned> &Resource : Used) {
       dbgs() << "[E] Resource Used: [" << Resource.first.first << '.'
-             << Resource.first.second << "]\n";
-      dbgs() << "           cycles: " << Resource.second << '\n';
+             << Resource.first.second << "], ";
+      dbgs() << "cycles: " << Resource.second << '\n';
     }
   });
-  notifyInstructionEvent(HWInstructionIssuedEvent(IR, Used));
+  notifyEvent<HWInstructionEvent>(HWInstructionIssuedEvent(IR, Used));
 }
 
 void ExecuteStage::notifyReservedBuffers(ArrayRef<uint64_t> Buffers) {

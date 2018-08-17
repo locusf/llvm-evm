@@ -266,9 +266,6 @@ class DwarfDebug : public DebugHandlerBase {
   /// Use inlined strings.
   bool UseInlineStrings = false;
 
-  /// Whether to emit DWARF pub sections or not.
-  bool UsePubSections = true;
-
   /// Allow emission of .debug_ranges section.
   bool UseRangesSection = true;
 
@@ -278,6 +275,9 @@ class DwarfDebug : public DebugHandlerBase {
 
   ///Allow emission of the .debug_loc section.
   bool UseLocSection = true;
+
+  /// Generate DWARF v4 type units.
+  bool GenerateTypeUnits;
 
   /// DWARF5 Experimental Options
   /// @{
@@ -331,9 +331,9 @@ class DwarfDebug : public DebugHandlerBase {
 
   using InlinedVariable = DbgValueHistoryMap::InlinedVariable;
 
-  void ensureAbstractVariableIsCreated(DwarfCompileUnit &CU, InlinedVariable Var,
+  void ensureAbstractVariableIsCreated(DwarfCompileUnit &CU, InlinedVariable IV,
                                        const MDNode *Scope);
-  void ensureAbstractVariableIsCreatedIfScoped(DwarfCompileUnit &CU, InlinedVariable Var,
+  void ensureAbstractVariableIsCreatedIfScoped(DwarfCompileUnit &CU, InlinedVariable IV,
                                                const MDNode *Scope);
 
   DbgVariable *createConcreteVariable(DwarfCompileUnit &TheCU,
@@ -342,9 +342,9 @@ class DwarfDebug : public DebugHandlerBase {
   /// Construct a DIE for this abstract scope.
   void constructAbstractSubprogramScopeDIE(DwarfCompileUnit &SrcCU, LexicalScope *Scope);
 
-  /// Helper function to add a name to the .debug_names table, using the
-  /// appropriate string pool.
-  void addAccelDebugName(StringRef Name, const DIE &Die);
+  template <typename DataT>
+  void addAccelNameImpl(const DICompileUnit &CU, AccelTable<DataT> &AppleAccel,
+                        StringRef Name, const DIE &Die);
 
   void finishVariableDefinitions();
 
@@ -405,6 +405,9 @@ class DwarfDebug : public DebugHandlerBase {
   /// Emit address ranges into a debug ranges section.
   void emitDebugRanges();
 
+  /// Emit range lists into a DWARF v5 debug rnglists section.
+  void emitDebugRnglists();
+
   /// Emit macros into a debug macinfo section.
   void emitDebugMacinfo();
   void emitMacro(DIMacro &M);
@@ -417,8 +420,13 @@ class DwarfDebug : public DebugHandlerBase {
   void initSkeletonUnit(const DwarfUnit &U, DIE &Die,
                         std::unique_ptr<DwarfCompileUnit> NewU);
 
-  /// Construct the split debug info compile unit for the debug info
-  /// section.
+  /// Construct the split debug info compile unit for the debug info section.
+  /// In DWARF v5, the skeleton unit DIE may have the following attributes:
+  /// DW_AT_addr_base, DW_AT_comp_dir, DW_AT_dwo_name, DW_AT_high_pc,
+  /// DW_AT_low_pc, DW_AT_ranges, DW_AT_stmt_list, and DW_AT_str_offsets_base.
+  /// Prior to DWARF v5 it may also have DW_AT_GNU_dwo_id. DW_AT_GNU_dwo_name
+  /// is used instead of DW_AT_dwo_name, Dw_AT_GNU_addr_base instead of
+  /// DW_AT_addr_base, and DW_AT_GNU_ranges_base instead of DW_AT_rnglists_base.
   DwarfCompileUnit &constructSkeletonCU(const DwarfCompileUnit &CU);
 
   /// Emit the debug info dwo section.
@@ -435,6 +443,9 @@ class DwarfDebug : public DebugHandlerBase {
 
   /// Emit the debug str dwo section.
   void emitDebugStrDWO();
+
+  /// Emit DWO addresses.
+  void emitDebugAddr();
 
   /// Flags to let the linker know we have emitted new style pubnames. Only
   /// emit it here if we don't have a skeleton CU for split dwarf.
@@ -529,9 +540,6 @@ public:
   /// Returns whether to use inline strings.
   bool useInlineStrings() const { return UseInlineStrings; }
 
-  /// Returns whether GNU pub sections should be emitted.
-  bool usePubSections() const { return UsePubSections; }
-
   /// Returns whether ranges section should be emitted.
   bool useRangesSection() const { return UseRangesSection; }
 
@@ -542,6 +550,9 @@ public:
 
   /// Returns whether .debug_loc section should be emitted.
   bool useLocSection() const { return UseLocSection; }
+
+  /// Returns whether to generate DWARF v4 type units.
+  bool generateTypeUnits() const { return GenerateTypeUnits; }
 
   // Experimental DWARF5 features.
 
@@ -591,17 +602,20 @@ public:
     return Ref.resolve();
   }
 
-  void addSubprogramNames(const DISubprogram *SP, DIE &Die);
+  void addSubprogramNames(const DICompileUnit &CU, const DISubprogram *SP,
+                          DIE &Die);
 
   AddressPool &getAddressPool() { return AddrPool; }
 
-  void addAccelName(StringRef Name, const DIE &Die);
+  void addAccelName(const DICompileUnit &CU, StringRef Name, const DIE &Die);
 
-  void addAccelObjC(StringRef Name, const DIE &Die);
+  void addAccelObjC(const DICompileUnit &CU, StringRef Name, const DIE &Die);
 
-  void addAccelNamespace(StringRef Name, const DIE &Die);
+  void addAccelNamespace(const DICompileUnit &CU, StringRef Name,
+                         const DIE &Die);
 
-  void addAccelType(StringRef Name, const DIE &Die, char Flags);
+  void addAccelType(const DICompileUnit &CU, StringRef Name, const DIE &Die,
+                    char Flags);
 
   const MachineFunction *getCurrentFunction() const { return CurFn; }
 

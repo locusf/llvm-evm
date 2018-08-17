@@ -17,8 +17,8 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/WithColor.h"
+#include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "llvm-mca"
 
@@ -155,10 +155,12 @@ static void computeMaxLatency(InstrDesc &ID, const MCInstrDesc &MCDesc,
   ID.MaxLatency = Latency < 0 ? 100U : static_cast<unsigned>(Latency);
 }
 
-static void populateWrites(InstrDesc &ID, const MCInst &MCI,
-                           const MCInstrDesc &MCDesc,
-                           const MCSchedClassDesc &SCDesc,
-                           const MCSubtargetInfo &STI) {
+Error InstrBuilder::populateWrites(InstrDesc &ID, const MCInst &MCI,
+                                   unsigned SchedClassID) {
+  const MCInstrDesc &MCDesc = MCII.get(MCI.getOpcode());
+  const MCSchedModel &SM = STI.getSchedModel();
+  const MCSchedClassDesc &SCDesc = *SM.getSchedClassDesc(SchedClassID);
+
   // These are for now the (strong) assumptions made by this algorithm:
   //  * The number of explicit and implicit register definitions in a MCInst
   //    matches the number of explicit and implicit definitions according to
@@ -196,7 +198,8 @@ static void populateWrites(InstrDesc &ID, const MCInst &MCI,
       const MCWriteLatencyEntry &WLE =
           *STI.getWriteLatencyEntry(&SCDesc, CurrentDef);
       // Conservatively default to MaxLatency.
-      Write.Latency = WLE.Cycles == -1 ? ID.MaxLatency : WLE.Cycles;
+      Write.Latency =
+          WLE.Cycles < 0 ? ID.MaxLatency : static_cast<unsigned>(WLE.Cycles);
       Write.SClassOrWriteResourceID = WLE.WriteResourceID;
     } else {
       // Assign a default latency for this write.
@@ -205,15 +208,18 @@ static void populateWrites(InstrDesc &ID, const MCInst &MCI,
     }
     Write.IsOptionalDef = false;
     LLVM_DEBUG({
-      dbgs() << "\t\tOpIdx=" << Write.OpIndex << ", Latency=" << Write.Latency
+      dbgs() << "\t\t[Def] OpIdx=" << Write.OpIndex
+             << ", Latency=" << Write.Latency
              << ", WriteResourceID=" << Write.SClassOrWriteResourceID << '\n';
     });
     CurrentDef++;
   }
 
-  if (CurrentDef != NumExplicitDefs)
-    llvm::report_fatal_error(
-        "error: Expected more register operand definitions. ");
+  if (CurrentDef != NumExplicitDefs) {
+    return make_error<StringError>(
+        "error: Expected more register operand definitions.",
+        inconvertibleErrorCode());
+  }
 
   CurrentDef = 0;
   for (CurrentDef = 0; CurrentDef < NumImplicitDefs; ++CurrentDef) {
@@ -225,7 +231,8 @@ static void populateWrites(InstrDesc &ID, const MCInst &MCI,
       const MCWriteLatencyEntry &WLE =
           *STI.getWriteLatencyEntry(&SCDesc, Index);
       // Conservatively default to MaxLatency.
-      Write.Latency = WLE.Cycles == -1 ? ID.MaxLatency : WLE.Cycles;
+      Write.Latency =
+          WLE.Cycles < 0 ? ID.MaxLatency : static_cast<unsigned>(WLE.Cycles);
       Write.SClassOrWriteResourceID = WLE.WriteResourceID;
     } else {
       // Assign a default latency for this write.
@@ -235,10 +242,12 @@ static void populateWrites(InstrDesc &ID, const MCInst &MCI,
 
     Write.IsOptionalDef = false;
     assert(Write.RegisterID != 0 && "Expected a valid phys register!");
-    LLVM_DEBUG(dbgs() << "\t\tOpIdx=" << Write.OpIndex << ", PhysReg="
-                      << Write.RegisterID << ", Latency=" << Write.Latency
-                      << ", WriteResourceID=" << Write.SClassOrWriteResourceID
-                      << '\n');
+    LLVM_DEBUG({
+      dbgs() << "\t\t[Def] OpIdx=" << Write.OpIndex
+             << ", PhysReg=" << MRI.getName(Write.RegisterID)
+             << ", Latency=" << Write.Latency
+             << ", WriteResourceID=" << Write.SClassOrWriteResourceID << '\n';
+    });
   }
 
   if (MCDesc.hasOptionalDef()) {
@@ -246,10 +255,10 @@ static void populateWrites(InstrDesc &ID, const MCInst &MCI,
     // MCInst sequence.
     const MCOperand &Op = MCI.getOperand(MCI.getNumOperands() - 1);
     if (i == MCI.getNumOperands() || !Op.isReg())
-      llvm::report_fatal_error(
+      return make_error<StringError>(
           "error: expected a register operand for an optional "
-          "definition. Instruction has not be correctly analyzed.\n",
-          false);
+          "definition. Instruction has not be correctly analyzed.",
+          inconvertibleErrorCode());
 
     WriteDescriptor &Write = ID.Writes[TotalDefs - 1];
     Write.OpIndex = MCI.getNumOperands() - 1;
@@ -258,25 +267,28 @@ static void populateWrites(InstrDesc &ID, const MCInst &MCI,
     Write.SClassOrWriteResourceID = 0;
     Write.IsOptionalDef = true;
   }
+
+  return ErrorSuccess();
 }
 
-static void populateReads(InstrDesc &ID, const MCInst &MCI,
-                          const MCInstrDesc &MCDesc,
-                          const MCSchedClassDesc &SCDesc,
-                          const MCSubtargetInfo &STI) {
-  unsigned SchedClassID = MCDesc.getSchedClass();
-  unsigned i = 0;
+Error InstrBuilder::populateReads(InstrDesc &ID, const MCInst &MCI,
+                                  unsigned SchedClassID) {
+  const MCInstrDesc &MCDesc = MCII.get(MCI.getOpcode());
   unsigned NumExplicitDefs = MCDesc.getNumDefs();
+
   // Skip explicit definitions.
+  unsigned i = 0;
   for (; i < MCI.getNumOperands() && NumExplicitDefs; ++i) {
     const MCOperand &Op = MCI.getOperand(i);
     if (Op.isReg())
       NumExplicitDefs--;
   }
 
-  if (NumExplicitDefs)
-    llvm::report_fatal_error(
-        "error: Expected more register operand definitions. ", false);
+  if (NumExplicitDefs) {
+    return make_error<StringError>(
+        "error: Expected more register operand definitions. ",
+        inconvertibleErrorCode());
+  }
 
   unsigned NumExplicitUses = MCI.getNumOperands() - i;
   unsigned NumImplicitUses = MCDesc.getNumImplicitUses();
@@ -286,7 +298,7 @@ static void populateReads(InstrDesc &ID, const MCInst &MCI,
   }
   unsigned TotalUses = NumExplicitUses + NumImplicitUses;
   if (!TotalUses)
-    return;
+    return ErrorSuccess();
 
   ID.Reads.resize(TotalUses);
   for (unsigned CurrentUse = 0; CurrentUse < NumExplicitUses; ++CurrentUse) {
@@ -294,7 +306,8 @@ static void populateReads(InstrDesc &ID, const MCInst &MCI,
     Read.OpIndex = i + CurrentUse;
     Read.UseIndex = CurrentUse;
     Read.SchedClassID = SchedClassID;
-    LLVM_DEBUG(dbgs() << "\t\tOpIdx=" << Read.OpIndex);
+    LLVM_DEBUG(dbgs() << "\t\t[Use] OpIdx=" << Read.OpIndex
+                      << ", UseIndex=" << Read.UseIndex << '\n');
   }
 
   for (unsigned CurrentUse = 0; CurrentUse < NumImplicitUses; ++CurrentUse) {
@@ -303,17 +316,19 @@ static void populateReads(InstrDesc &ID, const MCInst &MCI,
     Read.UseIndex = NumExplicitUses + CurrentUse;
     Read.RegisterID = MCDesc.getImplicitUses()[CurrentUse];
     Read.SchedClassID = SchedClassID;
-    LLVM_DEBUG(dbgs() << "\t\tOpIdx=" << Read.OpIndex
-                      << ", RegisterID=" << Read.RegisterID << '\n');
+    LLVM_DEBUG(dbgs() << "\t\t[Use] OpIdx=" << Read.OpIndex << ", RegisterID="
+                      << MRI.getName(Read.RegisterID) << '\n');
   }
+  return ErrorSuccess();
 }
 
-const InstrDesc &InstrBuilder::createInstrDescImpl(const MCInst &MCI) {
+Expected<const InstrDesc &>
+InstrBuilder::createInstrDescImpl(const MCInst &MCI) {
   assert(STI.getSchedModel().hasInstrSchedModel() &&
          "Itineraries are not yet supported!");
 
-  unsigned short Opcode = MCI.getOpcode();
   // Obtain the instruction descriptor from the opcode.
+  unsigned short Opcode = MCI.getOpcode();
   const MCInstrDesc &MCDesc = MCII.get(Opcode);
   const MCSchedModel &SM = STI.getSchedModel();
 
@@ -326,14 +341,29 @@ const InstrDesc &InstrBuilder::createInstrDescImpl(const MCInst &MCI) {
     while (SchedClassID && SM.getSchedClassDesc(SchedClassID)->isVariant())
       SchedClassID = STI.resolveVariantSchedClass(SchedClassID, &MCI, CPUID);
 
-    if (!SchedClassID)
-      llvm::report_fatal_error("unable to resolve this variant class.");
+    if (!SchedClassID) {
+      return make_error<StringError>("unable to resolve this variant class.",
+                                     inconvertibleErrorCode());
+    }
+  }
+
+  // Check if this instruction is supported. Otherwise, report an error.
+  const MCSchedClassDesc &SCDesc = *SM.getSchedClassDesc(SchedClassID);
+  if (SCDesc.NumMicroOps == MCSchedClassDesc::InvalidNumMicroOps) {
+    std::string ToString;
+    llvm::raw_string_ostream OS(ToString);
+    WithColor::error() << "found an unsupported instruction in the input"
+                       << " assembly sequence.\n";
+    MCIP.printInst(&MCI, OS, "", STI);
+    OS.flush();
+    WithColor::note() << "instruction: " << ToString << '\n';
+    return make_error<StringError>(
+        "Don't know how to analyze unsupported instructions",
+        inconvertibleErrorCode());
   }
 
   // Create a new empty descriptor.
   std::unique_ptr<InstrDesc> ID = llvm::make_unique<InstrDesc>();
-
-  const MCSchedClassDesc &SCDesc = *SM.getSchedClassDesc(SchedClassID);
   ID->NumMicroOps = SCDesc.NumMicroOps;
 
   if (MCDesc.isCall()) {
@@ -355,8 +385,10 @@ const InstrDesc &InstrBuilder::createInstrDescImpl(const MCInst &MCI) {
 
   initializeUsedResources(*ID, SCDesc, STI, ProcResourceMasks);
   computeMaxLatency(*ID, MCDesc, SCDesc, STI);
-  populateWrites(*ID, MCI, MCDesc, SCDesc, STI);
-  populateReads(*ID, MCI, MCDesc, SCDesc, STI);
+  if (auto Err = populateWrites(*ID, MCI, SchedClassID))
+    return std::move(Err);
+  if (auto Err = populateReads(*ID, MCI, SchedClassID))
+    return std::move(Err);
 
   LLVM_DEBUG(dbgs() << "\t\tMaxLatency=" << ID->MaxLatency << '\n');
   LLVM_DEBUG(dbgs() << "\t\tNumMicroOps=" << ID->NumMicroOps << '\n');
@@ -372,7 +404,8 @@ const InstrDesc &InstrBuilder::createInstrDescImpl(const MCInst &MCI) {
   return *VariantDescriptors[&MCI];
 }
 
-const InstrDesc &InstrBuilder::getOrCreateInstrDesc(const MCInst &MCI) {
+Expected<const InstrDesc &>
+InstrBuilder::getOrCreateInstrDesc(const MCInst &MCI) {
   if (Descriptors.find_as(MCI.getOpcode()) != Descriptors.end())
     return *Descriptors[MCI.getOpcode()];
 
@@ -382,9 +415,12 @@ const InstrDesc &InstrBuilder::getOrCreateInstrDesc(const MCInst &MCI) {
   return createInstrDescImpl(MCI);
 }
 
-std::unique_ptr<Instruction>
+Expected<std::unique_ptr<Instruction>>
 InstrBuilder::createInstruction(const MCInst &MCI) {
-  const InstrDesc &D = getOrCreateInstrDesc(MCI);
+  Expected<const InstrDesc &> DescOrErr = getOrCreateInstrDesc(MCI);
+  if (!DescOrErr)
+    return DescOrErr.takeError();
+  const InstrDesc &D = *DescOrErr;
   std::unique_ptr<Instruction> NewIS = llvm::make_unique<Instruction>(D);
 
   // Initialize Reads first.
@@ -413,7 +449,7 @@ InstrBuilder::createInstruction(const MCInst &MCI) {
 
   // Early exit if there are no writes.
   if (D.Writes.empty())
-    return NewIS;
+    return std::move(NewIS);
 
   // Track register writes that implicitly clear the upper portion of the
   // underlying super-registers using an APInt.
@@ -423,11 +459,15 @@ InstrBuilder::createInstruction(const MCInst &MCI) {
   // register writes implicitly clear the upper portion of a super-register.
   MCIA.clearsSuperRegisters(MRI, MCI, WriteMask);
 
+  // Check if this is a dependency breaking instruction.
+  if (MCIA.isDependencyBreaking(STI, MCI))
+    NewIS->setDependencyBreaking();
+
   // Initialize writes.
   unsigned WriteIndex = 0;
   for (const WriteDescriptor &WD : D.Writes) {
-    unsigned RegID =
-        WD.isImplicitWrite() ? WD.RegisterID : MCI.getOperand(WD.OpIndex).getReg();
+    unsigned RegID = WD.isImplicitWrite() ? WD.RegisterID
+                                          : MCI.getOperand(WD.OpIndex).getReg();
     // Check if this is a optional definition that references NoReg.
     if (WD.IsOptionalDef && !RegID) {
       ++WriteIndex;
@@ -440,6 +480,6 @@ InstrBuilder::createInstruction(const MCInst &MCI) {
     ++WriteIndex;
   }
 
-  return NewIS;
+  return std::move(NewIS);
 }
 } // namespace mca

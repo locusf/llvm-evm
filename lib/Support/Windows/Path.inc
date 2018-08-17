@@ -766,10 +766,12 @@ std::error_code setPermissions(const Twine &Path, perms Permissions) {
   return std::error_code();
 }
 
-std::error_code setLastModificationAndAccessTime(int FD, TimePoint<> Time) {
-  FILETIME FT = toFILETIME(Time);
+std::error_code setLastAccessAndModificationTime(int FD, TimePoint<> AccessTime,
+                                                 TimePoint<> ModificationTime) {
+  FILETIME AccessFT = toFILETIME(AccessTime);
+  FILETIME ModifyFT = toFILETIME(ModificationTime);
   HANDLE FileHandle = reinterpret_cast<HANDLE>(_get_osfhandle(FD));
-  if (!SetFileTime(FileHandle, NULL, &FT, &FT))
+  if (!SetFileTime(FileHandle, NULL, &AccessFT, &ModifyFT))
     return mapWindowsError(::GetLastError());
   return std::error_code();
 }
@@ -1049,6 +1051,8 @@ static DWORD nativeAccess(FileAccess Access, OpenFlags Flags) {
     Result |= GENERIC_WRITE;
   if (Flags & OF_Delete)
     Result |= DELETE;
+  if (Flags & OF_UpdateAtime)
+    Result |= FILE_WRITE_ATTRIBUTES;
   return Result;
 }
 
@@ -1104,6 +1108,19 @@ Expected<file_t> openNativeFile(const Twine &Name, CreationDisposition Disp,
       Name, Result, NativeDisp, NativeAccess, FILE_ATTRIBUTE_NORMAL, Inherit);
   if (EC)
     return errorCodeToError(EC);
+
+  if (Flags & OF_UpdateAtime) {
+    FILETIME FileTime;
+    SYSTEMTIME SystemTime;
+    GetSystemTime(&SystemTime);
+    if (SystemTimeToFileTime(&SystemTime, &FileTime) == 0 ||
+        SetFileTime(Result, NULL, &FileTime, NULL) == 0) {
+      DWORD LastError = ::GetLastError();
+      ::CloseHandle(Result);
+      return errorCodeToError(mapWindowsError(LastError));
+    }
+  }
+
   if (Flags & OF_Delete) {
     if ((EC = setDeleteDisposition(Result, true))) {
       ::CloseHandle(Result);

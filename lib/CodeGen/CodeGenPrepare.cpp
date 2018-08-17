@@ -223,8 +223,17 @@ static cl::opt<bool>
 
 namespace {
 
+enum ExtType {
+  ZeroExtension,   // Zero extension has been seen.
+  SignExtension,   // Sign extension has been seen.
+  BothExtension    // This extension type is used if we saw sext after
+                   // ZeroExtension had been set, or if we saw zext after
+                   // SignExtension had been set. It makes the type
+                   // information of a promoted instruction invalid.
+};
+
 using SetOfInstrs = SmallPtrSet<Instruction *, 16>;
-using TypeIsSExt = PointerIntPair<Type *, 1, bool>;
+using TypeIsSExt = PointerIntPair<Type *, 2, ExtType>;
 using InstrToOrigTy = DenseMap<Instruction *, TypeIsSExt>;
 using SExts = SmallVector<Instruction *, 16>;
 using ValueToSExts = DenseMap<Value *, SExts>;
@@ -321,16 +330,16 @@ class TypePromotionTransaction;
                                        bool isPreheader);
     bool optimizeBlock(BasicBlock &BB, bool &ModifiedDT);
     bool optimizeInst(Instruction *I, bool &ModifiedDT);
-    bool optimizeMemoryInst(Instruction *I, Value *Addr,
-                            Type *AccessTy, unsigned AS);
+    bool optimizeMemoryInst(Instruction *MemoryInst, Value *Addr,
+                            Type *AccessTy, unsigned AddrSpace);
     bool optimizeInlineAsmInst(CallInst *CS);
     bool optimizeCallInst(CallInst *CI, bool &ModifiedDT);
     bool optimizeExt(Instruction *&I);
     bool optimizeExtUses(Instruction *I);
-    bool optimizeLoadExt(LoadInst *I);
+    bool optimizeLoadExt(LoadInst *Load);
     bool optimizeSelectInst(SelectInst *SI);
-    bool optimizeShuffleVectorInst(ShuffleVectorInst *SI);
-    bool optimizeSwitchInst(SwitchInst *CI);
+    bool optimizeShuffleVectorInst(ShuffleVectorInst *SVI);
+    bool optimizeSwitchInst(SwitchInst *SI);
     bool optimizeExtractElementInst(Instruction *Inst);
     bool dupRetToEnableTailCallOpts(BasicBlock *BB);
     bool placeDbgValues(Function &F);
@@ -462,7 +471,10 @@ bool CodeGenPrepare::runOnFunction(Function &F) {
 
   if (!DisableBranchOpts) {
     MadeChange = false;
-    SmallPtrSet<BasicBlock*, 8> WorkList;
+    // Use a set vector to get deterministic iteration order. The order the
+    // blocks are removed may affect whether or not PHI nodes in successors
+    // are removed.
+    SmallSetVector<BasicBlock*, 8> WorkList;
     for (BasicBlock &BB : F) {
       SmallVector<BasicBlock *, 2> Successors(succ_begin(&BB), succ_end(&BB));
       MadeChange |= ConstantFoldTerminator(&BB, true);
@@ -477,8 +489,7 @@ bool CodeGenPrepare::runOnFunction(Function &F) {
     // Delete the dead blocks and any of their dead successors.
     MadeChange |= !WorkList.empty();
     while (!WorkList.empty()) {
-      BasicBlock *BB = *WorkList.begin();
-      WorkList.erase(BB);
+      BasicBlock *BB = WorkList.pop_back_val();
       SmallVector<BasicBlock*, 2> Successors(succ_begin(BB), succ_end(BB));
 
       DeleteDeadBlock(BB);
@@ -640,7 +651,7 @@ bool CodeGenPrepare::isMergingEmptyBlockProfitable(BasicBlock *BB,
         isa<IndirectBrInst>(Pred->getTerminator())))
     return true;
 
-  if (BB->getTerminator() != BB->getFirstNonPHI())
+  if (BB->getTerminator() != BB->getFirstNonPHIOrDbg())
     return true;
 
   // We use a simple cost heuristic which determine skipping merging is
@@ -1702,6 +1713,7 @@ bool CodeGenPrepare::optimizeCallInst(CallInst *CI, bool &ModifiedDT) {
       return true;
     }
     case Intrinsic::launder_invariant_group:
+    case Intrinsic::strip_invariant_group:
       II->replaceAllUsesWith(II->getArgOperand(0));
       II->eraseFromParent();
       return true;
@@ -2609,8 +2621,8 @@ public:
 
 private:
   bool matchScaledValue(Value *ScaleReg, int64_t Scale, unsigned Depth);
-  bool matchAddr(Value *V, unsigned Depth);
-  bool matchOperationAddr(User *Operation, unsigned Opcode, unsigned Depth,
+  bool matchAddr(Value *Addr, unsigned Depth);
+  bool matchOperationAddr(User *AddrInst, unsigned Opcode, unsigned Depth,
                           bool *MovedAway = nullptr);
   bool isProfitableToFoldIntoAddressingMode(Instruction *I,
                                             ExtAddrMode &AMBefore,
@@ -3232,7 +3244,7 @@ static bool MightBeFoldableInst(Instruction *I) {
     // Don't touch identity bitcasts.
     if (I->getType() == I->getOperand(0)->getType())
       return false;
-    return I->getType()->isPointerTy() || I->getType()->isIntegerTy();
+    return I->getType()->isIntOrPtrTy();
   case Instruction::PtrToInt:
     // PtrToInt is always a noop, as we know that the int type is pointer sized.
     return true;
@@ -3274,6 +3286,41 @@ namespace {
 
 /// Hepler class to perform type promotion.
 class TypePromotionHelper {
+  /// Utility function to add a promoted instruction \p ExtOpnd to
+  /// \p PromotedInsts and record the type of extension we have seen.
+  static void addPromotedInst(InstrToOrigTy &PromotedInsts,
+                              Instruction *ExtOpnd,
+                              bool IsSExt) {
+    ExtType ExtTy = IsSExt ? SignExtension : ZeroExtension;
+    InstrToOrigTy::iterator It = PromotedInsts.find(ExtOpnd);
+    if (It != PromotedInsts.end()) {
+      // If the new extension is same as original, the information in
+      // PromotedInsts[ExtOpnd] is still correct.
+      if (It->second.getInt() == ExtTy)
+        return;
+
+      // Now the new extension is different from old extension, we make
+      // the type information invalid by setting extension type to
+      // BothExtension.
+      ExtTy = BothExtension;
+    }
+    PromotedInsts[ExtOpnd] = TypeIsSExt(ExtOpnd->getType(), ExtTy);
+  }
+
+  /// Utility function to query the original type of instruction \p Opnd
+  /// with a matched extension type. If the extension doesn't match, we
+  /// cannot use the information we had on the original type.
+  /// BothExtension doesn't match any extension type.
+  static const Type *getOrigType(const InstrToOrigTy &PromotedInsts,
+                                 Instruction *Opnd,
+                                 bool IsSExt) {
+    ExtType ExtTy = IsSExt ? SignExtension : ZeroExtension;
+    InstrToOrigTy::const_iterator It = PromotedInsts.find(Opnd);
+    if (It != PromotedInsts.end() && It->second.getInt() == ExtTy)
+      return It->second.getPointer();
+    return nullptr;
+  }
+
   /// Utility function to check whether or not a sign or zero extension
   /// of \p Inst with \p ConsideredExtType can be moved through \p Inst by
   /// either using the operands of \p Inst or promoting \p Inst.
@@ -3462,10 +3509,9 @@ bool TypePromotionHelper::canGetThrough(const Instruction *Inst,
   // I.e., check that trunc just drops extended bits of the same kind of
   // the extension.
   // #1 get the type of the operand and check the kind of the extended bits.
-  const Type *OpndType;
-  InstrToOrigTy::const_iterator It = PromotedInsts.find(Opnd);
-  if (It != PromotedInsts.end() && It->second.getInt() == IsSExt)
-    OpndType = It->second.getPointer();
+  const Type *OpndType = getOrigType(PromotedInsts, Opnd, IsSExt);
+  if (OpndType)
+    ;
   else if ((IsSExt && isa<SExtInst>(Opnd)) || (!IsSExt && isa<ZExtInst>(Opnd)))
     OpndType = Opnd->getOperand(0)->getType();
   else
@@ -3593,8 +3639,7 @@ Value *TypePromotionHelper::promoteOperandForOther(
 
   // Remember the original type of the instruction before promotion.
   // This is useful to know that the high bits are sign extended bits.
-  PromotedInsts.insert(std::pair<Instruction *, TypeIsSExt>(
-      ExtOpnd, TypeIsSExt(ExtOpnd->getType(), IsSExt)));
+  addPromotedInst(PromotedInsts, ExtOpnd, IsSExt);
   // Step #1.
   TPT.mutateType(ExtOpnd, Ext->getType());
   // Step #2.
@@ -3720,8 +3765,7 @@ bool AddressingModeMatcher::matchOperationAddr(User *AddrInst, unsigned Opcode,
   case Instruction::BitCast:
     // BitCast is always a noop, and we can handle it as long as it is
     // int->int or pointer->pointer (we don't want int<->fp or something).
-    if ((AddrInst->getOperand(0)->getType()->isPointerTy() ||
-         AddrInst->getOperand(0)->getType()->isIntegerTy()) &&
+    if (AddrInst->getOperand(0)->getType()->isIntOrPtrTy() &&
         // Don't touch identity bitcasts.  These were probably put here by LSR,
         // and we don't want to mess around with them.  Assume it knows what it
         // is doing.
@@ -3799,8 +3843,13 @@ bool AddressingModeMatcher::matchOperationAddr(User *AddrInst, unsigned Opcode,
       } else {
         uint64_t TypeSize = DL.getTypeAllocSize(GTI.getIndexedType());
         if (ConstantInt *CI = dyn_cast<ConstantInt>(AddrInst->getOperand(i))) {
-          ConstantOffset += CI->getSExtValue() * TypeSize;
-        } else if (TypeSize) {  // Scales of zero don't do anything.
+          const APInt &CVal = CI->getValue();
+          if (CVal.getMinSignedBits() <= 64) {
+            ConstantOffset += CVal.getSExtValue() * TypeSize;
+            continue;
+          }
+        }
+        if (TypeSize) {  // Scales of zero don't do anything.
           // We only allow one variable index at the moment.
           if (VariableOperand != -1)
             return false;
@@ -5346,8 +5395,7 @@ bool CodeGenPrepare::optimizeExtUses(Instruction *I) {
 //   x = phi x1', x2'
 //   y = and x, 0xff
 bool CodeGenPrepare::optimizeLoadExt(LoadInst *Load) {
-  if (!Load->isSimple() ||
-      !(Load->getType()->isIntegerTy() || Load->getType()->isPointerTy()))
+  if (!Load->isSimple() || !Load->getType()->isIntOrPtrTy())
     return false;
 
   // Skip loads we've already transformed.

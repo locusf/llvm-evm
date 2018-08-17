@@ -169,6 +169,7 @@ StringRef Triple::getVendorTypeName(VendorType Kind) {
   case AMD: return "amd";
   case Mesa: return "mesa";
   case SUSE: return "suse";
+  case OpenEmbedded: return "oe";
   }
 
   llvm_unreachable("Invalid VendorType!");
@@ -465,6 +466,7 @@ static Triple::VendorType parseVendor(StringRef VendorName) {
     .Case("amd", Triple::AMD)
     .Case("mesa", Triple::Mesa)
     .Case("suse", Triple::SUSE)
+    .Case("oe", Triple::OpenEmbedded)
     .Default(Triple::UnknownVendor);
 }
 
@@ -885,6 +887,12 @@ std::string Triple::normalize(StringRef Str) {
       Found[Pos] = true;
       break;
     }
+  }
+
+  // Replace empty components with "unknown" value.
+  for (unsigned i = 0, e = Components.size(); i < e; ++i) {
+    if (Components[i].empty())
+      Components[i] = "unknown";
   }
 
   // Special case logic goes here.  At this point Arch, Vendor and OS have the

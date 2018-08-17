@@ -713,6 +713,8 @@ public:
   bool isTypePassByReference() const {
     return getFlags() & FlagTypePassByReference;
   }
+  bool isBigEndian() const { return getFlags() & FlagBigEndian; }
+  bool isLittleEndian() const { return getFlags() & FlagLittleEndian; }
 
   static bool classof(const Metadata *MD) {
     switch (MD->getMetadataID()) {
@@ -739,44 +741,53 @@ class DIBasicType : public DIType {
 
   DIBasicType(LLVMContext &C, StorageType Storage, unsigned Tag,
               uint64_t SizeInBits, uint32_t AlignInBits, unsigned Encoding,
-              ArrayRef<Metadata *> Ops)
+              DIFlags Flags, ArrayRef<Metadata *> Ops)
       : DIType(C, DIBasicTypeKind, Storage, Tag, 0, SizeInBits, AlignInBits, 0,
-               FlagZero, Ops),
+               Flags, Ops),
         Encoding(Encoding) {}
   ~DIBasicType() = default;
 
   static DIBasicType *getImpl(LLVMContext &Context, unsigned Tag,
                               StringRef Name, uint64_t SizeInBits,
                               uint32_t AlignInBits, unsigned Encoding,
-                              StorageType Storage, bool ShouldCreate = true) {
+                              DIFlags Flags, StorageType Storage,
+                              bool ShouldCreate = true) {
     return getImpl(Context, Tag, getCanonicalMDString(Context, Name),
-                   SizeInBits, AlignInBits, Encoding, Storage, ShouldCreate);
+                   SizeInBits, AlignInBits, Encoding, Flags, Storage,
+                   ShouldCreate);
   }
   static DIBasicType *getImpl(LLVMContext &Context, unsigned Tag,
                               MDString *Name, uint64_t SizeInBits,
                               uint32_t AlignInBits, unsigned Encoding,
-                              StorageType Storage, bool ShouldCreate = true);
+                              DIFlags Flags, StorageType Storage,
+                              bool ShouldCreate = true);
 
   TempDIBasicType cloneImpl() const {
     return getTemporary(getContext(), getTag(), getName(), getSizeInBits(),
-                        getAlignInBits(), getEncoding());
+                        getAlignInBits(), getEncoding(), getFlags());
   }
 
 public:
   DEFINE_MDNODE_GET(DIBasicType, (unsigned Tag, StringRef Name),
-                    (Tag, Name, 0, 0, 0))
+                    (Tag, Name, 0, 0, 0, FlagZero))
   DEFINE_MDNODE_GET(DIBasicType,
                     (unsigned Tag, StringRef Name, uint64_t SizeInBits,
-                     uint32_t AlignInBits, unsigned Encoding),
-                    (Tag, Name, SizeInBits, AlignInBits, Encoding))
+                     uint32_t AlignInBits, unsigned Encoding, DIFlags Flags),
+                    (Tag, Name, SizeInBits, AlignInBits, Encoding, Flags))
   DEFINE_MDNODE_GET(DIBasicType,
                     (unsigned Tag, MDString *Name, uint64_t SizeInBits,
-                     uint32_t AlignInBits, unsigned Encoding),
-                    (Tag, Name, SizeInBits, AlignInBits, Encoding))
+                     uint32_t AlignInBits, unsigned Encoding, DIFlags Flags),
+                    (Tag, Name, SizeInBits, AlignInBits, Encoding, Flags))
 
   TempDIBasicType clone() const { return cloneImpl(); }
 
   unsigned getEncoding() const { return Encoding; }
+
+  enum class Signedness { Signed, Unsigned };
+
+  /// Return the signedness of this type, or None if this type is neither
+  /// signed nor unsigned.
+  Optional<Signedness> getSignedness() const;
 
   static bool classof(const Metadata *MD) {
     return MD->getMetadataID() == DIBasicTypeKind;
@@ -1156,11 +1167,21 @@ public:
     NoDebug = 0,
     FullDebug,
     LineTablesOnly,
-    LastEmissionKind = LineTablesOnly
+    DebugDirectivesOnly,
+    LastEmissionKind = DebugDirectivesOnly
+  };
+
+  enum class DebugNameTableKind : unsigned {
+    Default = 0,
+    GNU = 1,
+    None = 2,
+    LastDebugNameTableKind = None
   };
 
   static Optional<DebugEmissionKind> getEmissionKind(StringRef Str);
-  static const char *EmissionKindString(DebugEmissionKind EK);
+  static const char *emissionKindString(DebugEmissionKind EK);
+  static Optional<DebugNameTableKind> getNameTableKind(StringRef Str);
+  static const char *nameTableKindString(DebugNameTableKind PK);
 
 private:
   unsigned SourceLanguage;
@@ -1170,17 +1191,19 @@ private:
   uint64_t DWOId;
   bool SplitDebugInlining;
   bool DebugInfoForProfiling;
-  bool GnuPubnames;
+  unsigned NameTableKind;
 
   DICompileUnit(LLVMContext &C, StorageType Storage, unsigned SourceLanguage,
                 bool IsOptimized, unsigned RuntimeVersion,
                 unsigned EmissionKind, uint64_t DWOId, bool SplitDebugInlining,
-                bool DebugInfoForProfiling, bool GnuPubnames, ArrayRef<Metadata *> Ops)
+                bool DebugInfoForProfiling, unsigned NameTableKind,
+                ArrayRef<Metadata *> Ops)
       : DIScope(C, DICompileUnitKind, Storage, dwarf::DW_TAG_compile_unit, Ops),
         SourceLanguage(SourceLanguage), IsOptimized(IsOptimized),
         RuntimeVersion(RuntimeVersion), EmissionKind(EmissionKind),
         DWOId(DWOId), SplitDebugInlining(SplitDebugInlining),
-        DebugInfoForProfiling(DebugInfoForProfiling), GnuPubnames(GnuPubnames) {
+        DebugInfoForProfiling(DebugInfoForProfiling),
+        NameTableKind(NameTableKind) {
     assert(Storage != Uniqued);
   }
   ~DICompileUnit() = default;
@@ -1194,14 +1217,15 @@ private:
           DIGlobalVariableExpressionArray GlobalVariables,
           DIImportedEntityArray ImportedEntities, DIMacroNodeArray Macros,
           uint64_t DWOId, bool SplitDebugInlining, bool DebugInfoForProfiling,
-          bool GnuPubnames, StorageType Storage, bool ShouldCreate = true) {
+          unsigned NameTableKind, StorageType Storage,
+          bool ShouldCreate = true) {
     return getImpl(
         Context, SourceLanguage, File, getCanonicalMDString(Context, Producer),
         IsOptimized, getCanonicalMDString(Context, Flags), RuntimeVersion,
         getCanonicalMDString(Context, SplitDebugFilename), EmissionKind,
         EnumTypes.get(), RetainedTypes.get(), GlobalVariables.get(),
         ImportedEntities.get(), Macros.get(), DWOId, SplitDebugInlining,
-        DebugInfoForProfiling, GnuPubnames, Storage, ShouldCreate);
+        DebugInfoForProfiling, NameTableKind, Storage, ShouldCreate);
   }
   static DICompileUnit *
   getImpl(LLVMContext &Context, unsigned SourceLanguage, Metadata *File,
@@ -1210,8 +1234,8 @@ private:
           unsigned EmissionKind, Metadata *EnumTypes, Metadata *RetainedTypes,
           Metadata *GlobalVariables, Metadata *ImportedEntities,
           Metadata *Macros, uint64_t DWOId, bool SplitDebugInlining,
-          bool DebugInfoForProfiling, bool GnuPubnames, StorageType Storage,
-          bool ShouldCreate = true);
+          bool DebugInfoForProfiling, unsigned NameTableKind,
+          StorageType Storage, bool ShouldCreate = true);
 
   TempDICompileUnit cloneImpl() const {
     return getTemporary(getContext(), getSourceLanguage(), getFile(),
@@ -1220,7 +1244,7 @@ private:
                         getEmissionKind(), getEnumTypes(), getRetainedTypes(),
                         getGlobalVariables(), getImportedEntities(),
                         getMacros(), DWOId, getSplitDebugInlining(),
-                        getDebugInfoForProfiling(), getGnuPubnames());
+                        getDebugInfoForProfiling(), getNameTableKind());
   }
 
 public:
@@ -1236,11 +1260,11 @@ public:
        DIGlobalVariableExpressionArray GlobalVariables,
        DIImportedEntityArray ImportedEntities, DIMacroNodeArray Macros,
        uint64_t DWOId, bool SplitDebugInlining, bool DebugInfoForProfiling,
-       bool GnuPubnames),
+       DebugNameTableKind NameTableKind),
       (SourceLanguage, File, Producer, IsOptimized, Flags, RuntimeVersion,
        SplitDebugFilename, EmissionKind, EnumTypes, RetainedTypes,
        GlobalVariables, ImportedEntities, Macros, DWOId, SplitDebugInlining,
-       DebugInfoForProfiling, GnuPubnames))
+       DebugInfoForProfiling, (unsigned)NameTableKind))
   DEFINE_MDNODE_GET_DISTINCT_TEMPORARY(
       DICompileUnit,
       (unsigned SourceLanguage, Metadata *File, MDString *Producer,
@@ -1248,11 +1272,12 @@ public:
        MDString *SplitDebugFilename, unsigned EmissionKind, Metadata *EnumTypes,
        Metadata *RetainedTypes, Metadata *GlobalVariables,
        Metadata *ImportedEntities, Metadata *Macros, uint64_t DWOId,
-       bool SplitDebugInlining, bool DebugInfoForProfiling, bool GnuPubnames),
+       bool SplitDebugInlining, bool DebugInfoForProfiling,
+       unsigned NameTableKind),
       (SourceLanguage, File, Producer, IsOptimized, Flags, RuntimeVersion,
        SplitDebugFilename, EmissionKind, EnumTypes, RetainedTypes,
        GlobalVariables, ImportedEntities, Macros, DWOId, SplitDebugInlining,
-       DebugInfoForProfiling, GnuPubnames))
+       DebugInfoForProfiling, NameTableKind))
 
   TempDICompileUnit clone() const { return cloneImpl(); }
 
@@ -1262,8 +1287,13 @@ public:
   DebugEmissionKind getEmissionKind() const {
     return (DebugEmissionKind)EmissionKind;
   }
+  bool isDebugDirectivesOnly() const {
+    return EmissionKind == DebugDirectivesOnly;
+  }
   bool getDebugInfoForProfiling() const { return DebugInfoForProfiling; }
-  bool getGnuPubnames() const { return GnuPubnames; }
+  DebugNameTableKind getNameTableKind() const {
+    return (DebugNameTableKind)NameTableKind;
+  }
   StringRef getProducer() const { return getStringOperand(1); }
   StringRef getFlags() const { return getStringOperand(2); }
   StringRef getSplitDebugFilename() const { return getStringOperand(3); }
@@ -2206,6 +2236,14 @@ public:
   /// Determines the size of the variable's type.
   Optional<uint64_t> getSizeInBits() const;
 
+  /// Return the signedness of this variable's type, or None if this type is
+  /// neither signed nor unsigned.
+  Optional<DIBasicType::Signedness> getSignedness() const {
+    if (auto *BT = dyn_cast<DIBasicType>(getType().resolve()))
+      return BT->getSignedness();
+    return None;
+  }
+
   StringRef getFilename() const {
     if (auto *F = getFile())
       return F->getFilename();
@@ -2312,6 +2350,11 @@ public:
     ///
     /// Return the number of elements in the operand (1 + args).
     unsigned getSize() const;
+
+    /// Append the elements of this operand to \p V.
+    void appendToVector(SmallVectorImpl<uint64_t> &V) const {
+      V.append(get(), get() + getSize());
+    }
   };
 
   /// An iterator for expression operands.
@@ -2415,15 +2458,28 @@ public:
 
   /// Prepend \p DIExpr with a deref and offset operation and optionally turn it
   /// into a stack value.
-  static DIExpression *prepend(const DIExpression *DIExpr, bool DerefBefore,
+  static DIExpression *prepend(const DIExpression *Expr, bool DerefBefore,
                                int64_t Offset = 0, bool DerefAfter = false,
                                bool StackValue = false);
 
   /// Prepend \p DIExpr with the given opcodes and optionally turn it into a
   /// stack value.
-  static DIExpression *prependOpcodes(const DIExpression *DIExpr,
+  static DIExpression *prependOpcodes(const DIExpression *Expr,
                                       SmallVectorImpl<uint64_t> &Ops,
                                       bool StackValue = false);
+
+  /// Append the opcodes \p Ops to \p DIExpr. Unlike \ref appendToStack, the
+  /// returned expression is a stack value only if \p DIExpr is a stack value.
+  /// If \p DIExpr describes a fragment, the returned expression will describe
+  /// the same fragment.
+  static DIExpression *append(const DIExpression *Expr, ArrayRef<uint64_t> Ops);
+
+  /// Convert \p DIExpr into a stack value if it isn't one already by appending
+  /// DW_OP_deref if needed, and appending \p Ops to the resulting expression.
+  /// If \p DIExpr describes a fragment, the returned expression will describe
+  /// the same fragment.
+  static DIExpression *appendToStack(const DIExpression *Expr,
+                                     ArrayRef<uint64_t> Ops);
 
   /// Create a DIExpression to describe one part of an aggregate variable that
   /// is fragmented across multiple Values. The DW_OP_LLVM_fragment operation

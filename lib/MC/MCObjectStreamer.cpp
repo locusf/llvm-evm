@@ -61,9 +61,12 @@ void MCObjectStreamer::flushPendingLabels(MCFragment *F, uint64_t FOffset) {
 
 // As a compile-time optimization, avoid allocating and evaluating an MCExpr
 // tree for (Hi - Lo) when Hi and Lo are offsets into the same fragment.
-static Optional<uint64_t> absoluteSymbolDiff(const MCSymbol *Hi,
-                                             const MCSymbol *Lo) {
+static Optional<uint64_t>
+absoluteSymbolDiff(MCAssembler &Asm, const MCSymbol *Hi, const MCSymbol *Lo) {
   assert(Hi && Lo);
+  if (Asm.getBackendPtr()->requiresDiffExpressionRelocations())
+    return None;
+
   if (!Hi->getFragment() || Hi->getFragment() != Lo->getFragment() ||
       Hi->isVariable() || Lo->isVariable())
     return None;
@@ -74,7 +77,7 @@ static Optional<uint64_t> absoluteSymbolDiff(const MCSymbol *Hi,
 void MCObjectStreamer::emitAbsoluteSymbolDiff(const MCSymbol *Hi,
                                               const MCSymbol *Lo,
                                               unsigned Size) {
-  if (Optional<uint64_t> Diff = absoluteSymbolDiff(Hi, Lo)) {
+  if (Optional<uint64_t> Diff = absoluteSymbolDiff(getAssembler(), Hi, Lo)) {
     EmitIntValue(*Diff, Size);
     return;
   }
@@ -83,7 +86,7 @@ void MCObjectStreamer::emitAbsoluteSymbolDiff(const MCSymbol *Hi,
 
 void MCObjectStreamer::emitAbsoluteSymbolDiffAsULEB128(const MCSymbol *Hi,
                                                        const MCSymbol *Lo) {
-  if (Optional<uint64_t> Diff = absoluteSymbolDiff(Hi, Lo)) {
+  if (Optional<uint64_t> Diff = absoluteSymbolDiff(getAssembler(), Hi, Lo)) {
     EmitULEB128IntValue(*Diff);
     return;
   }
@@ -660,7 +663,18 @@ void MCObjectStreamer::EmitFileDirective(StringRef Filename) {
   getAssembler().addFileName(Filename);
 }
 
+void MCObjectStreamer::EmitAddrsig() {
+  getAssembler().getWriter().emitAddrsigSection();
+}
+
+void MCObjectStreamer::EmitAddrsigSym(const MCSymbol *Sym) {
+  getAssembler().registerSymbol(*Sym);
+  getAssembler().getWriter().addAddrsigSymbol(Sym);
+}
+
 void MCObjectStreamer::FinishImpl() {
+  getContext().RemapDebugPaths();
+
   // If we are generating dwarf for assembly source files dump out the sections.
   if (getContext().getGenDwarfForAssembly())
     MCGenDwarfInfo::Emit(this);
@@ -668,6 +682,6 @@ void MCObjectStreamer::FinishImpl() {
   // Dump out the dwarf file & directory tables and line tables.
   MCDwarfLineTable::Emit(this, getAssembler().getDWARFLinetableParams());
 
-  flushPendingLabels(nullptr);
+  flushPendingLabels();
   getAssembler().Finish();
 }

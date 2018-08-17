@@ -13,6 +13,7 @@ def B : JoinedOrSeparate<["-"], "B">,
 defm input_target : Eq<"input-target">,
                     HelpText<"Format of the input file">,
                     Values<"binary">;
+def I : JoinedOrSeparate<[ "-" ], "I">, Alias<input_target>;
 defm output_target : Eq<"output-target">,
                      HelpText<"Format of the output file">,
                      Values<"binary">;
@@ -21,12 +22,25 @@ def O : JoinedOrSeparate<["-"], "O">,
 defm split_dwo : Eq<"split-dwo">,
                  MetaVarName<"dwo-file">,
                  HelpText<"Equivalent to extract-dwo on the input file to <dwo-file>, then strip-dwo on the input file">;
+
+def preserve_dates : Flag<[ "-", "--" ], "preserve-dates">,
+                     HelpText<"Preserve access and modification timestamps">;
+
+def p : Flag<[ "-" ], "p">, Alias<preserve_dates>;
+
 defm add_gnu_debuglink : Eq<"add-gnu-debuglink">,
                          MetaVarName<"debug-file">,
                          HelpText<"Add a .gnu_debuglink for <debug-file>">;
 defm remove_section : Eq<"remove-section">,
                       MetaVarName<"section">,
                       HelpText<"Remove <section>">;
+defm rename_section
+    : Eq<"rename-section">,
+      MetaVarName<"old=new[,flag1,...]">,
+      HelpText<
+          "Renames a section from old to new, optionally with specified flags. "
+          "Flags supported for GNU compatibility: alloc, load, noload, "
+          "readonly, debug, code, data, rom, share, contents, merge, strings.">;
 defm redefine_symbol : Eq<"redefine-sym">,
                        MetaVarName<"old=new">,
                        HelpText<"Change the name of a symbol old to new">;
@@ -94,3 +108,9 @@ def strip_unneeded : Flag<["-", "--"], "strip-unneeded">,
                       HelpText<"Remove all symbols not needed by relocations">;
 def keep_file_symbols : Flag<["-", "--"], "keep-file-symbols">,
                       HelpText<"Do not remove file symbols">;
+defm dump_section : Eq<"dump-section">,
+                   MetaVarName<"section=file">,
+                   HelpText<"Dump contents of section named <section> into file <file>">;
+defm prefix_symbols : Eq<"prefix-symbols">,
+                       MetaVarName<"prefix">,
+                       HelpText<"Add <prefix> to the start of every symbol name">;

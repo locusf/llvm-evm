@@ -18,15 +18,10 @@
 namespace mca {
 
 // Pin the vtable here in the implementation file.
-Stage::Stage() {}
+Stage::~Stage() = default;
 
 void Stage::addListener(HWEventListener *Listener) {
   Listeners.insert(Listener);
-}
-
-void Stage::notifyInstructionEvent(const HWInstructionEvent &Event) {
-  for (HWEventListener *Listener : Listeners)
-    Listener->onInstructionEvent(Event);
 }
 
 } // namespace mca

@@ -22,21 +22,16 @@
 //===----------------------------------------------------------------------===//
 
 #include "CodeRegion.h"
-#include "DispatchStage.h"
+#include "Context.h"
 #include "DispatchStatistics.h"
-#include "ExecuteStage.h"
 #include "FetchStage.h"
 #include "InstructionInfoView.h"
 #include "InstructionTables.h"
 #include "Pipeline.h"
 #include "PipelinePrinter.h"
-#include "RegisterFile.h"
 #include "RegisterFileStatistics.h"
 #include "ResourcePressureView.h"
-#include "RetireControlUnit.h"
 #include "RetireControlUnitStatistics.h"
-#include "RetireStage.h"
-#include "Scheduler.h"
 #include "SchedulerStatistics.h"
 #include "SummaryView.h"
 #include "TimelineView.h"
@@ -47,6 +42,7 @@
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Host.h"
@@ -101,7 +97,7 @@ static cl::opt<unsigned>
 
 static cl::opt<unsigned>
     RegisterFileSize("register-file-size",
-                     cl::desc("Maximum number of temporary registers which can "
+                     cl::desc("Maximum number of physical registers which can "
                               "be used for register mappings"),
                      cl::cat(ToolOptions), cl::init(0));
 
@@ -185,7 +181,6 @@ static cl::opt<bool>
 namespace {
 
 const Target *getTarget(const char *ProgName) {
-  TripleName = Triple::normalize(TripleName);
   if (TripleName.empty())
     TripleName = Triple::normalize(sys::getDefaultTargetTriple());
   Triple TheTriple(TripleName);
@@ -287,7 +282,8 @@ public:
   void EmitCommonSymbol(MCSymbol *Symbol, uint64_t Size,
                         unsigned ByteAlignment) override {}
   void EmitZerofill(MCSection *Section, MCSymbol *Symbol = nullptr,
-                    uint64_t Size = 0, unsigned ByteAlignment = 0) override {}
+                    uint64_t Size = 0, unsigned ByteAlignment = 0,
+                    SMLoc Loc = SMLoc()) override {}
   void EmitGPRel32Value(const MCExpr *Value) override {}
   void BeginCOFFSymbolDef(const MCSymbol *Symbol) override {}
   void EmitCOFFSymbolStorageClass(int StorageClass) override {}
@@ -465,7 +461,13 @@ int main(int argc, char **argv) {
     Width = DispatchWidth;
 
   // Create an instruction builder.
-  mca::InstrBuilder IB(*STI, *MCII, *MRI, *MCIA);
+  mca::InstrBuilder IB(*STI, *MCII, *MRI, *MCIA, *IP);
+
+  // Create a context to control ownership of the pipeline hardware.
+  mca::Context MCA(*MRI, *STI);
+
+  mca::PipelineOptions PO(Width, RegisterFileSize, LoadQueueSize,
+                          StoreQueueSize, AssumeNoAlias);
 
   // Number each region in the sequence.
   unsigned RegionIdx = 0;
@@ -488,32 +490,28 @@ int main(int argc, char **argv) {
                      PrintInstructionTables ? 1 : Iterations);
 
     if (PrintInstructionTables) {
-      mca::InstructionTables IT(SM, IB, S);
+      //  Create a pipeline, stages, and a printer.
+      auto P = llvm::make_unique<mca::Pipeline>();
+      P->appendStage(llvm::make_unique<mca::FetchStage>(IB, S));
+      P->appendStage(llvm::make_unique<mca::InstructionTables>(SM, IB));
+      mca::PipelinePrinter Printer(*P);
 
+      // Create the views for this pipeline, execute, and emit a report.
       if (PrintInstructionInfoView) {
-        IT.addView(
+        Printer.addView(
             llvm::make_unique<mca::InstructionInfoView>(*STI, *MCII, S, *IP));
       }
-
-      IT.addView(llvm::make_unique<mca::ResourcePressureView>(*STI, *IP, S));
-      IT.run();
-      IT.printReport(TOF->os());
+      Printer.addView(
+          llvm::make_unique<mca::ResourcePressureView>(*STI, *IP, S));
+      auto Err = P->run();
+      if (Err)
+        report_fatal_error(toString(std::move(Err)));
+      Printer.printReport(TOF->os());
       continue;
     }
 
-    // Create the hardware components required for the pipeline.
-    mca::RetireControlUnit RCU(SM);
-    mca::RegisterFile PRF(SM, *MRI, RegisterFileSize);
-    mca::Scheduler HWS(SM, LoadQueueSize, StoreQueueSize, AssumeNoAlias);
-
-    // Create the pipeline and add stages to it.
-    auto P = llvm::make_unique<mca::Pipeline>(
-        Width, RegisterFileSize, LoadQueueSize, StoreQueueSize, AssumeNoAlias);
-    P->appendStage(llvm::make_unique<mca::FetchStage>(IB, S));
-    P->appendStage(llvm::make_unique<mca::DispatchStage>(
-        *STI, *MRI, RegisterFileSize, Width, RCU, PRF, HWS));
-    P->appendStage(llvm::make_unique<mca::RetireStage>(RCU, PRF));
-    P->appendStage(llvm::make_unique<mca::ExecuteStage>(RCU, HWS));
+    // Create a basic pipeline simulating an out-of-order backend.
+    auto P = MCA.createDefaultPipeline(PO, IB, S);
     mca::PipelinePrinter Printer(*P);
 
     if (PrintSummaryView)
@@ -544,8 +542,13 @@ int main(int argc, char **argv) {
           *STI, *IP, S, TimelineMaxIterations, TimelineMaxCycles));
     }
 
-    P->run();
+    auto Err = P->run();
+    if (Err)
+      report_fatal_error(toString(std::move(Err)));
     Printer.printReport(TOF->os());
+
+    // Clear the InstrBuilder internal state in preparation for another round.
+    IB.clear();
   }
 
   TOF->keep();

@@ -32,55 +32,65 @@ void Pipeline::addEventListener(HWEventListener *Listener) {
 }
 
 bool Pipeline::hasWorkToProcess() {
-  const auto It = llvm::find_if(Stages, [](const std::unique_ptr<Stage> &S) {
+  return llvm::any_of(Stages, [](const std::unique_ptr<Stage> &S) {
     return S->hasWorkToComplete();
   });
-  return It != Stages.end();
 }
 
-// This routine returns early if any stage returns 'false' after execute() is
-// called on it.
-bool Pipeline::executeStages(InstRef &IR) {
-  for (const std::unique_ptr<Stage> &S : Stages)
-    if (!S->execute(IR))
-      return false;
-  return true;
+llvm::Error Pipeline::run() {
+  assert(!Stages.empty() && "Unexpected empty pipeline found!");
+
+  while (hasWorkToProcess()) {
+    notifyCycleBegin();
+    if (llvm::Error Err = runCycle())
+      return Err;
+    notifyCycleEnd();
+    ++Cycles;
+  }
+  return llvm::ErrorSuccess();
 }
 
-void Pipeline::postExecuteStages(const InstRef &IR) {
-  for (const std::unique_ptr<Stage> &S : Stages)
-    S->postExecute(IR);
-}
+llvm::Error Pipeline::runCycle() {
+  llvm::Error Err = llvm::ErrorSuccess();
+  // Update stages before we start processing new instructions.
+  for (auto I = Stages.rbegin(), E = Stages.rend(); I != E && !Err; ++I) {
+    const std::unique_ptr<Stage> &S = *I;
+    Err = S->cycleStart();
+  }
 
-void Pipeline::run() {
-  while (hasWorkToProcess())
-    runCycle(Cycles++);
-}
-
-void Pipeline::runCycle(unsigned Cycle) {
-  notifyCycleBegin(Cycle);
-
-  // Update the stages before we do any processing for this cycle.
+  // Now fetch and execute new instructions.
   InstRef IR;
-  for (auto &S : Stages)
-    S->preExecute(IR);
+  Stage &FirstStage = *Stages[0];
+  while (!Err && FirstStage.isAvailable(IR))
+    Err = FirstStage.execute(IR);
 
-  // Continue executing this cycle until any stage claims it cannot make
-  // progress.
-  while (executeStages(IR))
-    postExecuteStages(IR);
+  // Update stages in preparation for a new cycle.
+  for (auto I = Stages.rbegin(), E = Stages.rend(); I != E && !Err; ++I) {
+    const std::unique_ptr<Stage> &S = *I;
+    Err = S->cycleEnd();
+  }
 
-  notifyCycleEnd(Cycle);
+  return Err;
 }
 
-void Pipeline::notifyCycleBegin(unsigned Cycle) {
-  LLVM_DEBUG(dbgs() << "[E] Cycle begin: " << Cycle << '\n');
+void Pipeline::appendStage(std::unique_ptr<Stage> S) {
+  assert(S && "Invalid null stage in input!");
+  if (!Stages.empty()) {
+    Stage *Last = Stages.back().get();
+    Last->setNextInSequence(S.get());
+  }
+
+  Stages.push_back(std::move(S));
+}
+
+void Pipeline::notifyCycleBegin() {
+  LLVM_DEBUG(dbgs() << "[E] Cycle begin: " << Cycles << '\n');
   for (HWEventListener *Listener : Listeners)
     Listener->onCycleBegin();
 }
 
-void Pipeline::notifyCycleEnd(unsigned Cycle) {
-  LLVM_DEBUG(dbgs() << "[E] Cycle end: " << Cycle << "\n\n");
+void Pipeline::notifyCycleEnd() {
+  LLVM_DEBUG(dbgs() << "[E] Cycle end: " << Cycles << "\n\n");
   for (HWEventListener *Listener : Listeners)
     Listener->onCycleEnd();
 }

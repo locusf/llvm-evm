@@ -40,10 +40,11 @@ public:
   unsigned size() const { return Sequence.size(); }
   const InstVec &getSequence() const { return Sequence; }
 
-  bool hasNext() { return Current < (Iterations * size()); }
+  bool hasNext() const { return Current < (Iterations * size()); }
   void updateNext() { Current++; }
 
   const SourceRef peekNext() const {
+    assert(hasNext() && "Already at end of sequence!");
     unsigned Index = getCurrentInstructionIndex();
     return SourceRef(Current, Sequence[Index].get());
   }

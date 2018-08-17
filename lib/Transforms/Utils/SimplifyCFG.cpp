@@ -3861,9 +3861,9 @@ bool SimplifyCFGOpt::SimplifySingleResume(ResumeInst *RI) {
   }
 
   // The landingpad is now unreachable.  Zap it.
-  BB->eraseFromParent();
   if (LoopHeaders)
     LoopHeaders->erase(BB);
+  BB->eraseFromParent();
   return true;
 }
 
@@ -4083,9 +4083,9 @@ bool SimplifyCFGOpt::SimplifyReturn(ReturnInst *RI, IRBuilder<> &Builder) {
     // If we eliminated all predecessors of the block, delete the block now.
     if (pred_empty(BB)) {
       // We know there are no successors, so just nuke the block.
-      BB->eraseFromParent();
       if (LoopHeaders)
         LoopHeaders->erase(BB);
+      BB->eraseFromParent();
     }
 
     return true;
@@ -4245,9 +4245,9 @@ bool SimplifyCFGOpt::SimplifyUnreachable(UnreachableInst *UI) {
   // If this block is now dead, remove it.
   if (pred_empty(BB) && BB != &BB->getParent()->getEntryBlock()) {
     // We know there are no successors, so just nuke the block.
-    BB->eraseFromParent();
     if (LoopHeaders)
       LoopHeaders->erase(BB);
+    BB->eraseFromParent();
     return true;
   }
 
@@ -5950,17 +5950,20 @@ static bool passingValueIsAlwaysUndefined(Value *V, Instruction *I) {
     // Load from null is undefined.
     if (LoadInst *LI = dyn_cast<LoadInst>(Use))
       if (!LI->isVolatile())
-        return LI->getPointerAddressSpace() == 0;
+        return !NullPointerIsDefined(LI->getFunction(),
+                                     LI->getPointerAddressSpace());
 
     // Store to null is undefined.
     if (StoreInst *SI = dyn_cast<StoreInst>(Use))
       if (!SI->isVolatile())
-        return SI->getPointerAddressSpace() == 0 &&
+        return (!NullPointerIsDefined(SI->getFunction(),
+                                      SI->getPointerAddressSpace())) &&
                SI->getPointerOperand() == I;
 
     // A call to null is undefined.
     if (auto CS = CallSite(Use))
-      return CS.getCalledValue() == I;
+      return !NullPointerIsDefined(CS->getFunction()) &&
+             CS.getCalledValue() == I;
   }
   return false;
 }
