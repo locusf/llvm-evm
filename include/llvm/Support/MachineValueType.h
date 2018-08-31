@@ -171,6 +171,7 @@ namespace llvm {
       nxv2f64        = 106,   // n x  2 x f64
       nxv4f64        = 107,   // n x  4 x f64
       nxv8f64        = 108,   // n x  8 x f64
+      i256           = 127,
 
       FIRST_FP_VECTOR_VALUETYPE = v2f16,
       LAST_FP_VECTOR_VALUETYPE = nxv8f64,
@@ -723,6 +724,7 @@ namespace llvm {
       case nxv8i32:
       case nxv4i64:
       case nxv8f32:
+      case i256:
       case nxv4f64: return 256;
       case v512i1:
       case v64i8:
